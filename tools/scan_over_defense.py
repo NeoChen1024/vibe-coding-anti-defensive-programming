@@ -58,7 +58,7 @@ ROOT_XLANG_SUFFIXES = (".bat", ".spec", ".toml", ".json")
 #: 混合仓库里的 C/C++ 与绑定描述：pybind11 `.attr("func")`、Cython、SWIG 都可能按名字引用 Python 函数。
 #: 全仓搜索（C++ 目录命名差异大），跳过构建产物与第三方依赖。
 CPP_XLANG_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".pyx", ".pxd", ".i")
-CPP_XLANG_SKIP_DIRS = frozenset({"build", "dist", "out", "third_party", "thirdparty", "3rdparty", "external", "contrib"})
+CPP_XLANG_SKIP_DIRS = frozenset({"build", "CMakeFiles", "dist", "out", "third_party", "thirdparty", "3rdparty", "external", "contrib"})
 SKIP_DIRS = frozenset({"__pycache__", "node_modules", "vendor", ".venv"})
 KINDS = (
     "internal_reflect_literal",
@@ -311,7 +311,7 @@ def _cpp_xlang_files(repo_root: str) -> List[str]:
     files: List[str] = []
     for dirpath, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and d not in CPP_XLANG_SKIP_DIRS
-                             and not d.startswith((".", "cmake-build-")))
+                             and not d.startswith((".", "cmake-build-", "build-", "build_")))
         files.extend(os.path.join(dirpath, f) for f in sorted(filenames) if f.endswith(CPP_XLANG_SUFFIXES))
     return files
 

@@ -428,7 +428,7 @@ def cross_language_text(root):
     cpp_skip = {"node_modules", "__pycache__", "vendor", ".venv", "build", "dist", "out", "third_party", "thirdparty",
                 "3rdparty", "external", "contrib"}
     for dp, dns, fns in os.walk(root):
-        dns[:] = [x for x in dns if x not in cpp_skip and not x.startswith((".", "cmake-build-"))]
+        dns[:] = [x for x in dns if x not in cpp_skip and not x.startswith((".", "cmake-build-", "build-", "build_"))]
         for fn in fns:
             if fn.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".pyx", ".pxd", ".i")):
                 with open(os.path.join(dp, fn), encoding="utf-8", errors="ignore") as f:

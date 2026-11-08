@@ -197,6 +197,7 @@ python3 -m tools.scan_over_defense_cpp --fail-on-new --strict-parse   # 门禁�
 - **跨语言引用**：C++ 版会读取仓库里的 Python、`.pyx/.pxd`、SWIG `.i`、导出表 `.def/.map` 等，ctypes / pybind11 按名字调用的 C++ 函数不会被误判为 0 引用；反过来 Python 版的 0 引用判定也会读取仓库内 C/C++ 源码（pybind11 `.attr("func")` 等）。
 - **代价**：解析时间主要花在 libclang 处理重型头文件（pybind11、nlohmann/json 等）上，按 CPU 核数并行（`--jobs N` 可调）；实测 70 个文件的混合仓库约 30～50 秒。
 - **不能自洽的头文件**（缺前置 `#include`、被包在宿主的 `namespace` 里 include）单独解析会出错，引擎会改在包含它的源文件的翻译单元里分析它，避免类型丢失造成的误报。
+- **条件编译**：AST 与 clangd 只看当前编译配置启用的代码。靠“没看到某样东西”下结论的信号（未用参数、转发包装、参数进门覆盖、`(void)` 丢弃、空 catch、switch 未覆盖）在判断范围内含未启用的 `#if` 分支时不报；死代码扫描把“名字出现在未启用分支里”算作存活证据（例如只在 `_WIN32` 下调用的函数）。调用图本身仍只含当前配置的边。
 
 ### 7. C++ 调用图、符号定位、死代码与边界棘轮
 C++ 版与 Python 版共用产物结构、基线库与图指标（`tools/callgraph/callgraph_graph_metrics.py`），精确层由 clangd 担任（对应 Python 侧的 jedi / SCIP）：

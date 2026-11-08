@@ -39,8 +39,10 @@ TEST_FILE_STEMS = ("_test", "_tests", "_unittest", "Test", "Tests")
 PUBLIC_HEADER_DIRS = frozenset({"include"})
 SKIP_DIRS = frozenset({
     "__pycache__", "node_modules", "vendor", "third_party", "thirdparty", "3rdparty", "external", "extern",
-    "deps", "contrib", ".venv", "venv", "build", "out", "dist", "tmp",
+    "deps", "contrib", ".venv", "venv", "build", "out", "dist", "tmp", "CMakeFiles",
 })
+#: build-sanitize/、build_debug/、cmake-build-release/ 这类多配置构建目录里全是生成代码。
+SKIP_DIR_PREFIXES = ("build-", "build_", "cmake-build-", ".")
 #: 编译命令没写 -std 时 g++ 用自己的（较新）默认标准，而 libclang 默认较旧，所以统一补一个。
 FALLBACK_STD = "-std=gnu++20"
 #: 编译命令里与解析无关、或会让 libclang 去写文件的参数。
@@ -55,7 +57,7 @@ def rel(repo_root: str, path: str) -> str:
 
 
 def skip_dir(name: str) -> bool:
-    return name in SKIP_DIRS or name.startswith(("cmake-build-", "."))
+    return name in SKIP_DIRS or name.startswith(SKIP_DIR_PREFIXES)
 
 
 def iter_files(repo_root: str, suffixes: Tuple[str, ...]) -> List[str]:

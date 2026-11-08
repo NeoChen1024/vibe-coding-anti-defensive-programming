@@ -22,10 +22,15 @@
 - enum_switch_default                    O  枚举 switch 未覆盖全部值时用 default 兜底。
 - pure_forwarding_header                 B  只有 #include / using 的空壳转发头文件。
 - defense_wording / nolint / coverage_exclusion / diagnostic_suppression   注释与编译告警压制。
+
+条件编译：AST 只含当前编译配置启用的代码。靠“没看到某样东西”下结论的信号（未用参数、转发包装、
+参数进门覆盖、(void) 丢弃、空 catch、switch 未覆盖）在判断范围内含未启用的 #if 分支时一律不报；
+未启用分支里出现的标识符另记 inactive_identifiers，供死代码扫描作存活证据。
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 from collections import Counter
@@ -66,7 +71,38 @@ def _ck():
     global _cindex
     if _cindex is None:
         _cindex = load_clang()
+        _bind_skipped_ranges(_cindex)
     return _cindex
+
+
+def _bind_skipped_ranges(cindex) -> None:
+    """Python 绑定没有包装 clang_getAllSkippedRanges（预处理器跳过的 #if 分支），这里补上。"""
+
+    class SourceRangeList(ctypes.Structure):
+        _fields_ = [("count", ctypes.c_uint), ("ranges", ctypes.POINTER(cindex.SourceRange))]
+
+    lib = cindex.conf.lib
+    lib.clang_getAllSkippedRanges.argtypes = [cindex.TranslationUnit]
+    lib.clang_getAllSkippedRanges.restype = ctypes.POINTER(SourceRangeList)
+    lib.clang_disposeSourceRangeList.argtypes = [ctypes.POINTER(SourceRangeList)]
+    lib.clang_disposeSourceRangeList.restype = None
+
+
+def _skipped_ranges(cindex, tu, abs_path: str) -> List[Tuple[int, int]]:
+    """本文件里被预处理器跳过的区段（字节偏移，含 #if/#else 指令行本身）。需以详细预处理记录解析。"""
+    lib = cindex.conf.lib
+    handle = lib.clang_getAllSkippedRanges(tu)
+    try:
+        listing = handle.contents
+        spans = []
+        for index in range(listing.count):
+            span = listing.ranges[index]
+            start = span.start
+            if start.file is not None and os.path.normpath(start.file.name) == abs_path:
+                spans.append((start.offset, span.end.offset))
+        return sorted(spans)
+    finally:
+        lib.clang_disposeSourceRangeList(handle)
 
 
 class _Kinds:
@@ -110,6 +146,8 @@ class FileAnalyzer:
         self.unresolved: List[Dict[str, Any]] = []
         self.classes: List[Dict[str, Any]] = []
         self.exports: List[Dict[str, Any]] = []
+        self.inactive = _skipped_ranges(cindex, tu, self.abs_path)
+        self.inactive_identifiers: Counter = Counter()
         self._null_seen: Set[int] = set()
         self._callee_offsets: Set[int] = set()
         self._func_loc: Dict[int, str] = {}
@@ -123,6 +161,16 @@ class FileAnalyzer:
     def in_main(self, cursor) -> bool:
         loc_file = cursor.location.file
         return loc_file is not None and os.path.normpath(loc_file.name) == self.abs_path
+
+    def has_inactive(self, cursor) -> bool:
+        """游标范围内含被预处理器跳过的分支：靠“没看到”下结论的信号在这里不可信。"""
+        if not self.inactive or not self.in_main(cursor):
+            return False
+        start, end = cursor.extent.start.offset, cursor.extent.end.offset
+        return any(lo < end and hi > start for lo, hi in self.inactive)
+
+    def in_inactive(self, offset: int) -> bool:
+        return any(lo <= offset < hi for lo, hi in self.inactive)
 
     def children(self, cursor) -> List[Any]:
         return list(cursor.get_children())
@@ -448,7 +496,7 @@ class FileAnalyzer:
             return
         if not unresolved and enumerators <= covered:
             self.hit("enum_switch_dead_default", default_node, decl.spelling, func, enumerators=len(enumerators))
-        else:
+        elif not self.has_inactive(node):  # 未启用分支里可能还有 case，覆盖度算不准
             self.hit("enum_switch_default", default_node, decl.spelling, func,
                      covered=len(covered & enumerators), enumerators=len(enumerators), unresolved_labels=unresolved)
 
@@ -475,7 +523,8 @@ class FileAnalyzer:
             type_toks = type_toks[:-1]
         core = "".join(t for t in type_toks if t not in ("const", "volatile", "&", "&&")).lstrip(":")
         broad = caught == "..." or core in ("std::exception", "exception")
-        empty = body.kind == self.ck.COMPOUND_STMT and not self.children(body)
+        conditional = self.has_inactive(body)
+        empty = body.kind == self.ck.COMPOUND_STMT and not self.children(body) and not conditional
         reraises = any(
             sub.kind == self.ck.CXX_THROW_EXPR or (sub.kind == self.ck.CALL_EXPR and sub.spelling in RETHROW_CALLS)
             for sub in self.walk(body)
@@ -483,7 +532,8 @@ class FileAnalyzer:
         if broad and empty:
             self.hit("silent_broad_catch", node, caught, func)
         if broad:
-            self.hit("broad_catch", node, caught, func, reraises=reraises, empty=empty)
+            # conditional：处理体含未启用的 #if 分支，reraises/empty 只反映当前编译配置。
+            self.hit("broad_catch", node, caught, func, reraises=reraises, empty=empty, conditional=conditional)
         elif empty:
             self.hit("swallowed_catch", node, caught, func)
 
@@ -493,7 +543,8 @@ class FileAnalyzer:
             return
         inner = self.strip(exprs[-1])
         if node.type.kind == self.cx.TypeKind.VOID:
-            if inner.kind in self.k.NAMED_REFS:
+            # `(void)x;` 常用于 x 只在某个 #if 分支里用到——那是正当用法。
+            if inner.kind in self.k.NAMED_REFS and not (func is not None and self.has_inactive(func)):
                 self.hit("void_cast_discard", node, inner.spelling, func, code=self.snippet(node))
             return
         if inner.kind not in self.k.EXPLICIT_CASTS:
@@ -743,12 +794,14 @@ class FileAnalyzer:
         for node in pre_body:
             pre_refs |= self._param_refs(node, set(hashes))
         stmt_refs = [self._param_refs(stmt, set(hashes)) for stmt in stmts]
+        self._default_null_required(func, defaults, params, body)
+        if self.has_inactive(body):
+            return  # 未启用的 #if 分支里可能读参数、多一条语句：下面三个“缺席”判断都不成立
         self._param_overwritten(func, named, stmts, stmt_refs, pre_refs)
         if exempt in ("virtual", "special") and func.spelling != "main":
             return
         self._unused_params(func, named, stmts, stmt_refs, pre_refs, exempt)
         self._passthrough(func, named, stmts, exempt)
-        self._default_null_required(func, defaults, params, body)
 
     def _param_overwritten(self, func, named, stmts, stmt_refs, pre_refs) -> None:
         value_params = [p for p in named if p.type.kind not in
@@ -873,6 +926,8 @@ class FileAnalyzer:
             spelling = token.spelling
             if token.kind == token_kind.IDENTIFIER:
                 self.identifiers[spelling] += 1
+                if self.inactive and self.in_inactive(token.location.offset):
+                    self.inactive_identifiers[spelling] += 1
                 if prod and spelling in UNUSED_MARKERS:
                     self.hits.append({"file": self.rel_path, "kind": "unused_suppression", "line": token.location.line,
                                       "symbol": spelling, "func": "<file>"})
@@ -912,7 +967,8 @@ class FileAnalyzer:
 
 def _parse(cindex, abs_path: str, args: List[str]):
     try:
-        return cindex.Index.create().parse(abs_path, args=args), None
+        options = cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD  # 才会记录跳过的 #if 分支
+        return cindex.Index.create().parse(abs_path, args=args, options=options), None
     except cindex.TranslationUnitLoadError as exc:
         return None, str(exc)
 
@@ -950,7 +1006,7 @@ def analyze_task(task: Task) -> Dict[str, Any]:
                 tu, errors, hosted_by = host_tu, host_errors, host[0]
     if tu is None:
         return {"path": rel_path, "role": role, "fatal": fatal, "errors": [], "hits": [], "decl_sites": {},
-                "defs": [], "calls": [], "identifiers": {}, "edges": [], "unresolved": [], "classes": [],
+                "defs": [], "calls": [], "identifiers": {}, "inactive_identifiers": {}, "edges": [], "unresolved": [], "classes": [],
                 "exports": []}
     analyzer = FileAnalyzer(cindex, repo_root, rel_path, role, tu, text)
     analyzer.run()
@@ -958,4 +1014,5 @@ def analyze_task(task: Task) -> Dict[str, Any]:
             "hosted_by": hosted_by,
             "hits": analyzer.hits, "decl_sites": dict(analyzer.decl_sites), "defs": analyzer.defs,
             "calls": analyzer.calls, "identifiers": dict(analyzer.identifiers), "edges": analyzer.edges,
+            "inactive_identifiers": dict(analyzer.inactive_identifiers),
             "unresolved": analyzer.unresolved, "classes": analyzer.classes, "exports": analyzer.exports}

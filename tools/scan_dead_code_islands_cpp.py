@@ -7,6 +7,7 @@
 - 豁免证据（两种模式都用）：虚函数/覆写（经基类指针派发）、构造析构等特殊成员与 main、
   导出属性 / extern "C"、宏生成、include/ 公开头文件声明（对外 API）。
 - 跨语言证据（两种模式都用）：仓库里的 Python、Cython、SWIG、导出表出现同名标识符（ctypes 按名字调用）。
+- 条件编译证据（两种模式都用）：名字出现在当前编译配置未启用的 #if 分支里（如只在 _WIN32 下调用）。
 - quick：同名标识符在生产 / 测试 / 工具 C++ 里出现（token 数减声明数 > 0）。按名字算，同名重载会互相掩护。
 - precise：改用 clangd 的编译器级 textDocument/references，不再按名字匹配，所以同名重载、
   同名局部变量都不会掩护死函数。要求 clangd + compile_commands.json（见 tools/cpp_scan/clangd.py）。
@@ -72,6 +73,8 @@ def analyze(repo_root: str, mode: str, compile_db_dir: Optional[str], jobs: Opti
     facts, graph = _extract.build(repo_root, compile_db_dir, jobs, extra_roles=("test",))
     candidates = graph.islands()
     xlang = crossref.cross_language_words(facts.repo_root)
+    # AST 与 clangd 都只看当前编译配置；名字出现在别的配置（未启用 #if 分支）里就不能断定死。
+    inactive = {name for fact in facts.of_role("prod", "test", "tool") for name in fact["inactive_identifiers"]}
     broken = {fact["path"] for fact in facts.facts if fact["fatal"] or fact["error_count"]}
     unverified = sorted(key for key in candidates if graph.record_by_key[key]["file"] in broken)
     evidence: Dict[str, List[str]] = {}
@@ -84,6 +87,8 @@ def analyze(repo_root: str, mode: str, compile_db_dir: Optional[str], jobs: Opti
             evidence[key] = [f"exempt:{record['exempt'] or 'virtual'}"]
         elif record["name"] in xlang:
             evidence[key] = [f"cross_language:{record['name']}"]
+        elif record["name"] in inactive:
+            evidence[key] = [f"inactive_preprocessor_branch:{record['name']}"]
         else:
             remaining.append(key)
     if mode == "quick":
