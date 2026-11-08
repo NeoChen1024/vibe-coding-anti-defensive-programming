@@ -8,7 +8,7 @@
   提到该参数的顶层语句是 `参数 = ...`（或元组解包/带注解赋值），且右侧不读它。
 - zero_ref_func：生产代码中全仓同名唯一、名字不短于 4、非嵌套、无装饰器（装饰器视为框架注册）、
   非 dunder 的函数/方法，生产、tests/、宿主工具（tools/、scripts/ 的 Python）都没有引用，
-  跨语言文本（前端、.cjs、模板、静态产物、打包脚本等）也搜不到。
+  跨语言文本（前端、.cjs、模板、静态产物、打包脚本，以及混合仓库里的 C/C++、Cython、SWIG 源码）也搜不到。
 - test_only_func：同上，但仅被 tests/ 引用。
 - foreign_private_attr_assign：函数内往非 self/cls、非导入名的对象写私有属性 `obj._attr = ...`
   （含增量赋值、带值注解赋值、元组/列表解包目标）。obj 是本函数里刚构造出的新对象时豁免：`X.__new__(...)`、
@@ -55,6 +55,10 @@ SCAN_ROOTS = PROD_ROOTS + (FRONTEND_ROOT,)
 XLANG_ROOTS = ("frontend", "tests", "templates", "static", "scripts", "packaging")
 XLANG_SUFFIXES = (".js", ".jsx", ".cjs", ".mjs", ".html", ".json", ".bat", ".ps1", ".spec", ".txt")
 ROOT_XLANG_SUFFIXES = (".bat", ".spec", ".toml", ".json")
+#: 混合仓库里的 C/C++ 与绑定描述：pybind11 `.attr("func")`、Cython、SWIG 都可能按名字引用 Python 函数。
+#: 全仓搜索（C++ 目录命名差异大），跳过构建产物与第三方依赖。
+CPP_XLANG_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".pyx", ".pxd", ".i")
+CPP_XLANG_SKIP_DIRS = frozenset({"build", "dist", "out", "third_party", "thirdparty", "3rdparty", "external", "contrib"})
 SKIP_DIRS = frozenset({"__pycache__", "node_modules", "vendor", ".venv"})
 KINDS = (
     "internal_reflect_literal",
@@ -303,8 +307,18 @@ def _scan_prod_tree(
                     hits.append(Hit(rel_path, "foreign_private_attr_assign", node.lineno, f"{owner}.{attr}"))
 
 
+def _cpp_xlang_files(repo_root: str) -> List[str]:
+    files: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and d not in CPP_XLANG_SKIP_DIRS
+                             and not d.startswith((".", "cmake-build-")))
+        files.extend(os.path.join(dirpath, f) for f in sorted(filenames) if f.endswith(CPP_XLANG_SUFFIXES))
+    return files
+
+
 def _cross_language_words(repo_root: str) -> Set[str]:
     paths = [os.path.join(repo_root, rel) for rel in _iter_files(repo_root, XLANG_ROOTS, XLANG_SUFFIXES)]
+    paths.extend(_cpp_xlang_files(repo_root))
     paths.extend(
         os.path.join(repo_root, name) for name in sorted(os.listdir(repo_root))
         if name.endswith(ROOT_XLANG_SUFFIXES) and os.path.isfile(os.path.join(repo_root, name))

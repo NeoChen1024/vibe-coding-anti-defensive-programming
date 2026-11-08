@@ -424,6 +424,15 @@ def cross_language_text(root):
                             chunks.append(f.read())
                     except OSError:
                         pass
+    # 混合仓库：C/C++、Cython、SWIG 可能按名字引用 Python 函数（pybind11 `.attr("func")` 等）
+    cpp_skip = {"node_modules", "__pycache__", "vendor", ".venv", "build", "dist", "out", "third_party", "thirdparty",
+                "3rdparty", "external", "contrib"}
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [x for x in dns if x not in cpp_skip and not x.startswith((".", "cmake-build-"))]
+        for fn in fns:
+            if fn.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".pyx", ".pxd", ".i")):
+                with open(os.path.join(dp, fn), encoding="utf-8", errors="ignore") as f:
+                    chunks.append(f.read())
     for fn in os.listdir(root):
         if fn.endswith((".bat", ".spec", ".toml", ".json")):
             try:

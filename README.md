@@ -1,6 +1,6 @@
 # Vibe Coding 反防御性编程（Anti-Over-Defense & Multi-Model Pipeline Kit）
 
-> **告别 AI 堆屎山与防御性垃圾代码**：用 **4 条第一性原理 + 15 大母题 + 140 项实战黑名单** 约束大模型，配合 **三模型多车道制衡流水线（Gemini 广撒网/首稿 ↔ Claude 核验/返修 ↔ Codex 反方/严审）** 与 **AST / 调用图静态猎杀工具集**，让 Vibe Coding 写出真正源头统一、零冗余兜底的生产级代码。
+> **告别 AI 堆屎山与防御性垃圾代码**：用 **4 条第一性原理 + 15 大母题 + 140 项实战黑名单** 约束大模型，配合 **三模型多车道制衡流水线（Gemini 广撒网/首稿 ↔ Claude 核验/返修 ↔ Codex 反方/严审）** 与 **Python / C++ AST 与调用图静态猎杀工具集**，让 Vibe Coding 写出真正源头统一、零冗余兜底的生产级代码。
 
 ---
 
@@ -42,7 +42,10 @@ vibe-coding-anti-defensive-programming/
     ├── scan_dead_code_islands.py              # 6. 0 调用死代码孤岛防回潮扫描器（AST 快模 + SCIP 精模）
     ├── dead_code_usage/                       # 死代码孤岛 AST / SCIP 引用分析引擎
     ├── symbol_locator/                        # 7. 函数定义与上下游调用链定位器（whereis / callers / callees）
-    └── callgraph/                             # 8. 函数级静态调用图与风险数据流提取引擎
+    ├── callgraph/                             # 8. 函数级静态调用图与风险数据流提取引擎
+    ├── scan_over_defense_cpp.py               # 9. C++ 反过度防御棘轮门禁（9 类高精度信号，与 Python 版共用基线库）
+    ├── scan_over_defense_cpp_deep.py          # 10. C++ 全量深度探针（31 类 libclang AST / 跨文件信号）
+    └── cpp_scan/                              # C++ 扫描引擎（libclang 解析、单文件检测器、跨文件引用分析）
 ```
 
 ---
@@ -89,6 +92,9 @@ claude() {
 
 ### 3. 接入 `tools/` 扫描与定位工具集
 将 `tools/` 目录复制到目标 Python 仓库根目录下（或放入 `PYTHONPATH`），并根据目标仓库的实际顶层源码目录调整 `SCAN_ROOTS` / `PROD_ROOTS`（默认已涵盖 `src`, `core`, `web`, `data`, `app`, `plugins`, `desktop` 等常见目录）。
+
+C++ 扫描器额外依赖 libclang 的 Python 绑定（`pip install libclang`，或发行版的 `python-clang` / `python3-clang`）；
+强烈建议在目标仓库生成 `compile_commands.json`（`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`，或 `bear -- make`），否则依赖类型的信号会因找不到头文件而漏报。
 
 ---
 
@@ -158,3 +164,32 @@ python3 -m tools.scan_private_imports --fail-on-new
 # 扫描删文件后残留在源码或测试中的失效路径字符串
 python3 -m tools.scan_dead_path_literals --fail-on-new
 ```
+
+### 6. C++ 版反过度防御扫描（Python + C++ 混合仓库）
+`tools/cpp_scan/` 用 libclang 解析 C++ AST，把 Python 版的母题信号翻译成 C++ 形态；两个入口与 Python 版**同口径、同输出结构、同一套棘轮基线库**，混合仓库可以并排跑、把两份报告一起交给审查：
+
+| Python 版信号 | C++ 对应信号 | 母题 |
+| :--- | :--- | :--- |
+| 对非 Optional 参数判 `None` | `null_check_on_reference`（`&ref == nullptr`）、`null_check_on_this`、`null_check_after_new`（`new` / `make_unique` 后判空） | F / K |
+| 宽泛 `except` | `silent_broad_catch`、`broad_catch`（`catch (...)` / `catch (std::exception&)`，附 reraises/empty）、`swallowed_catch` | K |
+| 参数进门即被覆盖 / 未使用参数 / `_ = name` | `param_overwritten`（按值参数）、`unused_param`、`void_cast_discard`（`(void)x;`）、`unused_suppression`（`[[maybe_unused]]` 等） | A |
+| 默认值兜底后假必填 / 伪可选 / 恒常量开关 | `default_null_then_required`（`T* p = nullptr` 又对 null 抛异常）、`optional_always_passed`、`param_never_passed_in_prod`、`param_constant_everywhere` | A |
+| 0 引用 / 仅测试引用函数 | `zero_ref_func` / `test_only_func`（虚函数、特殊成员、`extern "C"`、导出属性、宏生成、`include/` 公开 API 豁免；Python/Cython/SWIG 里出现同名即豁免） | A / D |
+| 单行透传包装 / 纯重导出空壳 | `passthrough_wrapper`、`pure_forwarding_header` | B |
+| 往返转换 / 反射探测 / `or` 空字面量兜底 | `cast_roundtrip`、`string_number_roundtrip`、`json_roundtrip`；`dynamic_cast_probe`、`const_cast`；`optional_value_or` | M / F / O |
+| 死分支 | `delete_null_guard`（`if (p) delete p;`）、`enum_switch_dead_default`（已覆盖全部枚举值仍留 `default:`）、`enum_switch_default` | A / O |
+| 防御性注释 / `noqa` / `pragma: no cover` | `defense_wording`、`nolint`、`coverage_exclusion`（LCOV_EXCL）、`diagnostic_suppression`（`#pragma ... diagnostic ignored`） | — |
+
+```bash
+# 全量深度探针：输出 hits.json（结构同 Python 版）
+python3 tools/scan_over_defense_cpp_deep.py --root . --out /tmp/over_defense_cpp_report
+
+# 高精度棘轮门禁（前 9 类信号；基线存于 .checkup/over_defense_cpp_baseline.json，只减不增）
+python3 -m tools.scan_over_defense_cpp
+python3 -m tools.scan_over_defense_cpp --refresh
+python3 -m tools.scan_over_defense_cpp --fail-on-new --strict-parse   # 门禁环境：解析出错也阻断
+```
+- **文件角色**按路径片段判断，适配 monorepo 中嵌套的子项目：任一级目录名为 `tests/test/...` 或文件名形如 `test_x.cpp`、`x_test.cc` 为测试；`tools/scripts/examples/benchmarks/...` 为工具（只计引用不报信号）；`build/`、`third_party/`、`vendor/`、`contrib/` 等整体跳过；`--prod-dirs a,b` 可收窄报信号的范围。
+- **编译参数**：自动合并仓库根及一、二级子目录下 `build/`、`out/`、`cmake-build-*` 里的全部 `compile_commands.json`，也可用 `--compile-commands DIR` 指定；没有时退回 `-std=gnu++20` 并把所有 `include/` 与含头文件的目录加入 `-I`。
+- **跨语言引用**：C++ 版会读取仓库里的 Python、`.pyx/.pxd`、SWIG `.i`、导出表 `.def/.map` 等，ctypes / pybind11 按名字调用的 C++ 函数不会被误判为 0 引用；反过来 Python 版的 0 引用判定也会读取仓库内 C/C++ 源码（pybind11 `.attr("func")` 等）。
+- **代价**：解析时间主要花在 libclang 处理重型头文件（pybind11、nlohmann/json 等）上，按 CPU 核数并行（`--jobs N` 可调）；实测 70 个文件的混合仓库约 50 秒。
