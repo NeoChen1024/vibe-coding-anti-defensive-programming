@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import ast
 import glob
-import json
 import os
 import sys
 from collections import defaultdict
@@ -26,6 +25,7 @@ if HERE not in sys.path:
 import callgraph_call_sites as _callsites  # 保留完整接收者的调用点提取 leaf helper
 import callgraph_dataflow as _flow  # 敏感值共现与风险数据流 leaf helper
 import callgraph_function_index as _findex  # callable/import alias AST 索引 leaf helper
+import callgraph_graph_metrics as _metrics  # 图指标/扇入扇出/产物写出（与 C++ 提取器共用）
 import callgraph_type_resolver as _tresolver  # 两档类型消解（Tier 1 AST + Tier 2 SCIP/Runtime）
 
 FIRST_PARTY_ROOTS = ("src", "core", "web", "data", "app", "tools", "scripts", "plugins", "desktop")
@@ -137,10 +137,6 @@ def _method_names(file_funcs: Dict[str, List[FuncInfo]], info: FuncInfo) -> Set[
 
 def _edge(source: str, target: str, kind: str, ambiguous: bool) -> Dict[str, Any]:
     return {"from": source, "to": target, "kind": kind, "ambiguous": ambiguous}
-
-
-def _edge_key(edge: Dict[str, Any]) -> Tuple[str, str, str, bool]:
-    return (str(edge["from"]), str(edge["to"]), str(edge["kind"]), bool(edge["ambiguous"]))
 
 
 def _add_bare_edges(
@@ -278,110 +274,6 @@ def _resolve_edges(all_funcs: Dict[str, FuncInfo], name_to_quals: Dict[str, List
     return edges, dynamic_unresolved, dataflow_nodes
 
 
-def _fan_counts(edges: List[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], Dict[str, int]]:
-    fan_out: Dict[str, int] = defaultdict(int)
-    fan_in: Dict[str, int] = defaultdict(int)
-    ambiguous_fan_out: Dict[str, int] = defaultdict(int)
-    ambiguous_fan_in: Dict[str, int] = defaultdict(int)
-    for edge in edges:
-        if edge["ambiguous"]:
-            ambiguous_fan_out[edge["from"]] += 1
-            ambiguous_fan_in[edge["to"]] += 1
-            continue
-        fan_out[edge["from"]] += 1
-        fan_in[edge["to"]] += 1
-    return fan_in, fan_out, ambiguous_fan_in, ambiguous_fan_out
-
-
-def _write_json(name: str, obj: Any) -> None:
-    with open(os.path.join(OUT_DIR, name), "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(obj, fh, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-        fh.write("\n")
-
-
-def _cycle_key(cycle: List[str]) -> List[str]:
-    if not cycle:
-        return []
-    smallest = min(range(len(cycle)), key=lambda idx: cycle[idx])
-    return cycle[smallest:] + cycle[:smallest]
-
-
-def _bounded_cycles(nx: Any, graph: Any) -> List[List[str]]:
-    cycles: List[List[str]] = []
-    for cycle in nx.simple_cycles(graph):
-        if 2 <= len(cycle) <= 8:
-            cycles.append(_cycle_key(list(cycle)))
-        if len(cycles) >= 200:
-            break
-    return sorted(cycles)
-
-
-def _articulation_points(nx: Any, graph: Any) -> List[str]:
-    undirected = graph.to_undirected()
-    if not undirected.number_of_nodes():
-        return []
-    largest = max(nx.connected_components(undirected), key=len)
-    return list(nx.articulation_points(undirected.subgraph(largest)))
-
-
-def _graph_metrics(all_funcs: Dict[str, FuncInfo], edges: List[Dict[str, Any]]) -> Dict[str, Any]:
-    try:
-        import networkx as nx
-    except ImportError as exc:
-        raise RuntimeError("缺少 networkx，不能生成可信的调用图指标。") from exc
-
-    graph = nx.DiGraph()
-    total_graph = nx.DiGraph()
-    graph.add_nodes_from(all_funcs.keys())
-    total_graph.add_nodes_from(all_funcs.keys())
-    graph.add_edges_from((edge["from"], edge["to"]) for edge in edges if not edge["ambiguous"])
-    total_graph.add_edges_from((edge["from"], edge["to"]) for edge in edges)
-    cycles = _bounded_cycles(nx, graph)
-    islands = [node for node in total_graph.nodes if total_graph.in_degree(node) == 0 and total_graph.out_degree(node) == 0]
-    articulation = _articulation_points(nx, graph)
-    _write_json("cycles.json", cycles)
-    _write_json("islands.json", sorted(islands))
-    _write_json("articulation_points.json", sorted(articulation))
-    return {
-        "node_count": graph.number_of_nodes(),
-        "edge_count": graph.number_of_edges(),
-        "edge_count_confident": graph.number_of_edges(),
-        "edge_count_total": total_graph.number_of_edges(),
-        "cycle_count": len(cycles),
-        "cycle_count_semantics": "confident-edge simple cycles of length 2..8, capped at 200",
-        "island_count": len(islands),
-        "articulation_count": len(articulation),
-    }
-
-
-def _high_fan_in(all_funcs: Dict[str, FuncInfo], fan_in: Dict[str, int]) -> List[Dict[str, Any]]:
-    rows = (
-        {"func": qual, "rel": all_funcs[qual]["rel"], "line": all_funcs[qual]["line"], "fan_in": count}
-        for qual, count in fan_in.items() if count >= 5
-    )
-    return sorted(rows, key=lambda item: (-item["fan_in"], item["rel"], item["line"], item["func"]))[:60]
-
-
-def _functions_payload(
-    all_funcs: Dict[str, FuncInfo],
-    fan_in: Dict[str, int],
-    fan_out: Dict[str, int],
-    ambiguous_fan_in: Dict[str, int],
-    ambiguous_fan_out: Dict[str, int],
-) -> Dict[str, Dict[str, Any]]:
-    return {
-        qual: {"rel": info["rel"], "line": info["line"], "end": info["end"], "cls": info["cls"],
-               "name": info["name"],
-               "fan_in": fan_in.get(qual, 0) + ambiguous_fan_in.get(qual, 0),
-               "fan_out": fan_out.get(qual, 0) + ambiguous_fan_out.get(qual, 0),
-               "fan_in_confident": fan_in.get(qual, 0),
-               "fan_out_confident": fan_out.get(qual, 0),
-               "fan_in_ambiguous": ambiguous_fan_in.get(qual, 0),
-               "fan_out_ambiguous": ambiguous_fan_out.get(qual, 0)}
-        for qual, info in all_funcs.items()
-    }
-
-
 def _summary(all_funcs: Dict[str, FuncInfo], edges: List[Dict[str, Any]],
              dynamic_unresolved: List[Dict[str, Any]], dataflow_nodes: Dict[str, Dict[str, List[str]]],
              risk: List[Dict[str, Any]], high_fan_in: List[Dict[str, Any]],
@@ -406,19 +298,20 @@ def _write_outputs(all_funcs: Dict[str, FuncInfo], edges: List[Dict[str, Any]],
                    fan_in: Dict[str, int], fan_out: Dict[str, int],
                    ambiguous_fan_in: Dict[str, int], ambiguous_fan_out: Dict[str, int],
                    parse_errors: List[str]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    edges = sorted(edges, key=_edge_key)
+    edges = sorted(edges, key=_metrics.edge_key)
     dynamic_unresolved = sorted(dynamic_unresolved, key=lambda item: (item["rel"], item["line"], item["func"]))
-    graph_metrics = _graph_metrics(all_funcs, edges)
+    graph_metrics = _metrics.graph_metrics(OUT_DIR, list(all_funcs.keys()), edges)
     risk = _flow.risk_rows(dataflow_nodes, all_funcs, fan_in, fan_out)
-    high_fan_in = _high_fan_in(all_funcs, fan_in)
+    high_fan_in = _metrics.high_fan_in(all_funcs, fan_in)
     summary = _summary(all_funcs, edges, dynamic_unresolved, dataflow_nodes, risk, high_fan_in, graph_metrics, parse_errors)
-    _write_json("functions.json", _functions_payload(all_funcs, fan_in, fan_out, ambiguous_fan_in, ambiguous_fan_out))
-    _write_json("edges.json", edges)
-    _write_json("dynamic_unresolved.json", dynamic_unresolved)
-    _write_json("dataflow_nodes.json", dataflow_nodes)
-    _write_json("risk_dataflow.json", risk)
-    _write_json("high_fan_in.json", high_fan_in)
-    _write_json("summary.json", summary)
+    fans = (fan_in, fan_out, ambiguous_fan_in, ambiguous_fan_out)
+    _metrics.write_json(OUT_DIR, "functions.json", _metrics.functions_payload(all_funcs, fans))
+    _metrics.write_json(OUT_DIR, "edges.json", edges)
+    _metrics.write_json(OUT_DIR, "dynamic_unresolved.json", dynamic_unresolved)
+    _metrics.write_json(OUT_DIR, "dataflow_nodes.json", dataflow_nodes)
+    _metrics.write_json(OUT_DIR, "risk_dataflow.json", risk)
+    _metrics.write_json(OUT_DIR, "high_fan_in.json", high_fan_in)
+    _metrics.write_json(OUT_DIR, "summary.json", summary)
     return summary, risk
 
 
@@ -478,7 +371,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             runtime_edges_path=rt_path,
         )
         print(f"[deep 模式融合] {deep_stats}")
-    fan_in, fan_out, ambiguous_fan_in, ambiguous_fan_out = _fan_counts(edges)
+    fan_in, fan_out, ambiguous_fan_in, ambiguous_fan_out = _metrics.fan_counts(edges)
     summary, risk = _write_outputs(
         all_funcs,
         edges,

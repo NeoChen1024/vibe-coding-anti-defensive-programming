@@ -21,6 +21,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -86,6 +87,30 @@ def discover(repo_root: str, prod_dirs: Sequence[str] = ()) -> Dict[str, List[st
     return roles
 
 
+INCLUDE_RE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
+
+
+def include_search_dirs(args: Sequence[str]) -> Dict[str, List[str]]:
+    """从解析参数里取头文件搜索路径（-iquote / -I / -isystem，均已是绝对路径）。"""
+    dirs: Dict[str, List[str]] = {"-iquote": [], "-I": [], "-isystem": []}
+    for arg in args:
+        for flag in dirs:
+            if arg.startswith(flag) and len(arg) > len(flag):
+                dirs[flag].append(arg[len(flag):])
+                break
+    return dirs
+
+
+def resolve_include(includer: str, target: str, quoted: bool, dirs: Dict[str, List[str]]) -> Optional[str]:
+    """按编译器顺序解析 #include：引号形式先找包含者所在目录与 -iquote，再 -I、-isystem。"""
+    search = ([os.path.dirname(includer)] + dirs["-iquote"] if quoted else []) + dirs["-I"] + dirs["-isystem"]
+    for directory in search:
+        candidate = os.path.normpath(os.path.join(directory, target))
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def is_public_header(rel_path: str) -> bool:
     return any(p in PUBLIC_HEADER_DIRS for p in rel_path.split("/")[:-1])
 
@@ -139,7 +164,7 @@ def _clean_arguments(arguments: Sequence[str], source: str, directory: str) -> L
     return cleaned
 
 
-def _find_compile_dbs(repo_root: str, override: Optional[str]) -> List[str]:
+def find_compile_dbs(repo_root: str, override: Optional[str]) -> List[str]:
     if override:
         path = os.path.join(override, "compile_commands.json")
         if not os.path.isfile(path):
@@ -159,7 +184,7 @@ class ParseConfig:
 
     def __init__(self, repo_root: str, headers: Sequence[str], compile_db_dir: Optional[str] = None):
         self.repo_root = repo_root
-        self.compile_dbs = _find_compile_dbs(repo_root, compile_db_dir)
+        self.compile_dbs = find_compile_dbs(repo_root, compile_db_dir)
         self.per_file: Dict[str, List[str]] = {}
         resource = _resource_dir()
         self.base = ["-xc++", "-ferror-limit=0", "-Wno-everything"] + (["-resource-dir", resource] if resource else [])

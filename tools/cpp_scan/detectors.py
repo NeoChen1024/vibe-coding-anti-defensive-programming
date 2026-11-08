@@ -46,6 +46,16 @@ STO_FUNCS = frozenset({"stoi", "stol", "stoll", "stoul", "stoull", "stof", "stod
 MAKE_FUNCS = frozenset({"make_unique", "make_shared", "make_unique_for_overwrite", "make_shared_for_overwrite",
                         "allocate_shared"})
 FATAL_CALLS = frozenset({"abort", "terminate", "__assert_fail", "__assert_rtn", "_assert", "exit", "quick_exit"})
+#: 模板里对这些名字的依赖调用几乎总是标准库容器 / 智能指针 / optional 的成员，不按名字连到仓库函数
+#: （对应 Python 版过滤内置容器方法）。
+STD_MEMBER_NAMES = frozenset({
+    "begin", "end", "cbegin", "cend", "rbegin", "rend", "size", "empty", "data", "get", "value", "value_or",
+    "has_value", "reset", "release", "push_back", "emplace_back", "pop_back", "push_front", "pop_front", "insert",
+    "emplace", "erase", "find", "count", "contains", "at", "front", "back", "clear", "reserve", "resize",
+    "c_str", "str", "substr", "length", "swap", "lock", "unlock", "load", "store", "first", "second",
+})
+#: 绑定库把 C++ 函数按名字暴露给 Python 的注册调用。
+EXPORT_CALLS = frozenset({"def", "def_static"})
 RETHROW_CALLS = frozenset({"rethrow_exception", "rethrow_if_nested", "terminate", "abort"})
 SNIPPET_LIMIT = 200
 
@@ -96,7 +106,13 @@ class FileAnalyzer:
         self.defs: List[Dict[str, Any]] = []
         self.calls: List[Dict[str, Any]] = []
         self.identifiers: Counter = Counter()
+        self.edges: List[Dict[str, Any]] = []
+        self.unresolved: List[Dict[str, Any]] = []
+        self.classes: List[Dict[str, Any]] = []
+        self.exports: List[Dict[str, Any]] = []
         self._null_seen: Set[int] = set()
+        self._callee_offsets: Set[int] = set()
+        self._func_loc: Dict[int, str] = {}
         self._line_offsets = [0]
         for index, byte in enumerate(text):
             if byte == 0x0A:
@@ -231,9 +247,15 @@ class FileAnalyzer:
 
     def run(self) -> None:
         self._scan_tokens()
-        top = [c for c in self.tu.cursor.get_children() if self.in_main(c)]
-        for root in top:
-            self._visit_tree(root)
+        # 借宿解析时头文件可能被宿主包在 namespace / extern "C" 里 #include，要穿过宿主的这些容器找本文件的游标。
+        containers = (self.ck.NAMESPACE, self.ck.LINKAGE_SPEC, self.ck.UNEXPOSED_DECL)
+        pending = list(self.tu.cursor.get_children())
+        while pending:
+            node = pending.pop(0)
+            if self.in_main(node):
+                self._visit_tree(node)
+            elif node.kind in containers:
+                pending[:0] = self.children(node)
         if self.role == "prod":
             self._scan_lines()
 
@@ -251,10 +273,16 @@ class FileAnalyzer:
                     self.decl_sites[node.spelling] += 1
                 if node.is_definition():
                     inner_func = node
+                    record = self._record_def(node, func)
                     if self.role == "prod":
-                        self._function(node, func)
+                        self._function(node, record)
             elif kind == self.ck.CALL_EXPR:
                 self._call(node, func)
+            elif kind == self.ck.DECL_REF_EXPR:
+                self._decl_ref(node, func)
+            elif kind in self.k.CLASSES:
+                if node.is_definition():
+                    self._record_class(node)
             elif self.role == "prod":
                 self._node(node, func)
             stack.extend((child, inner_func) for child in reversed(self.children(node)))
@@ -482,8 +510,17 @@ class FileAnalyzer:
     def _call(self, node, func) -> None:
         name = node.spelling
         ref = node.referenced
-        if ref is not None and ref.kind in (self.ck.FUNCTION_DECL, self.ck.CXX_METHOD) and not name.startswith("operator"):
-            self._record_call(node, ref)
+        caller = self._func_loc.get(func.hash) if func is not None else None
+        if ref is not None and ref.kind in self.k.FUNCS:
+            self._mark_callee(node, ref)
+            if ref.kind in (self.ck.FUNCTION_DECL, self.ck.CXX_METHOD) and not name.startswith("operator"):
+                self._record_call(node, ref)
+            if caller is not None:
+                self._edge(caller, ref, node)
+        if caller is not None:
+            self._unresolved(node, ref, caller)
+        if name in EXPORT_CALLS:
+            self._export(node)
         if self.role != "prod":
             return
         args = [a for a in node.get_arguments() if a.extent.start.file is not None]
@@ -494,6 +531,126 @@ class FileAnalyzer:
             self.hit("string_number_roundtrip", node, name, func, code=self.snippet(node))
         elif args and name == "parse" and self.strip_conversions(args[0]).spelling == "dump":
             self.hit("json_roundtrip", node, name, func, code=self.snippet(node))
+
+    # ---------- 调用图事实 ----------
+
+    def loc_of(self, cursor) -> Optional[str]:
+        """仓库内声明/定义的位置键 `rel:line:col`；仓库外（标准库、三方）返回 None。"""
+        loc_file = cursor.location.file
+        if loc_file is None:
+            return None
+        path = os.path.normpath(loc_file.name)
+        if not path.startswith(self.repo_root + os.sep):
+            return None
+        return f"{rel(self.repo_root, path)}:{cursor.location.line}:{cursor.location.column}"
+
+    def _target(self, ref) -> Optional[Dict[str, str]]:
+        """被引用函数的身份：优先定义位置（模板实例化也指回模式定义），其次 USR（定义在别的翻译单元）。"""
+        if self.loc_of(ref) is None:
+            return None
+        definition = ref.get_definition()
+        target = {"to_usr": ref.get_usr()}
+        if definition is not None:
+            loc = self.loc_of(definition)
+            if loc is None:
+                return None
+            target["to_loc"] = loc
+        return target
+
+    def _mark_callee(self, node, ref) -> None:
+        for child in self.children(node):
+            callee = self.strip(child)
+            if callee.kind in self.k.NAMED_REFS and callee.spelling == ref.spelling:
+                self._callee_offsets.add(callee.extent.start.offset)
+
+    def _qualified_call(self, node) -> bool:
+        kids = self.children(node)
+        callee = self.strip(kids[0]) if kids else None
+        return callee is not None and callee.kind == self.ck.MEMBER_REF_EXPR and "::" in self.tokens(callee)
+
+    def _edge(self, caller: str, ref, node) -> None:
+        target = self._target(ref)
+        if target is None:
+            return
+        record: Dict[str, Any] = {"from": caller, "line": node.location.line,
+                                  "kind": "constructor" if ref.kind == self.ck.CONSTRUCTOR else "call", **target}
+        if ref.kind == self.ck.CXX_METHOD and ref.is_virtual_method() and not self._qualified_call(node):
+            record["kind"] = "virtual"
+            record["virtual"] = {"class_usr": ref.semantic_parent.get_usr(), "name": ref.spelling,
+                                 "sig": ref.type.spelling}
+        self.edges.append(record)
+
+    def _decl_ref(self, node, func) -> None:
+        """函数名不作为被调方出现：取地址、当回调传递、注册表里登记。"""
+        ref = node.referenced
+        if ref is None or ref.kind not in self.k.FUNCS or node.extent.start.offset in self._callee_offsets:
+            return
+        caller = self._func_loc.get(func.hash) if func is not None else None
+        target = self._target(ref)
+        if caller is not None and target is not None:
+            self.edges.append({"from": caller, "line": node.location.line, "kind": "function_reference", **target})
+
+    def _unresolved(self, node, ref, caller: str) -> None:
+        """静态画不出的调用：模板依赖名、函数指针 / std::function 回调。"""
+        kids = self.children(node)
+        callee = self.strip(kids[0]) if kids else None
+        if ref is None:
+            if callee is not None and callee.kind == self.ck.TYPE_REF:
+                return
+            name = node.spelling or (self._dependent_name(callee) if callee is not None else "")
+            if name and name not in STD_MEMBER_NAMES:
+                self.unresolved.append({"from": caller, "line": node.location.line, "hint": f"dependent:{name}",
+                                        "name": name})
+        elif ref.kind in (self.ck.VAR_DECL, self.ck.PARM_DECL, self.ck.FIELD_DECL):
+            self.unresolved.append({"from": caller, "line": node.location.line, "hint": f"callback:{ref.spelling}",
+                                    "name": None})
+        elif node.spelling == "operator()" and self.loc_of(ref) is None and callee is not None \
+                and callee.kind in self.k.NAMED_REFS and callee.referenced is not None \
+                and callee.referenced.kind in (self.ck.VAR_DECL, self.ck.PARM_DECL, self.ck.FIELD_DECL):
+            self.unresolved.append({"from": caller, "line": node.location.line,
+                                    "hint": f"callback:{callee.spelling}", "name": None})
+
+    def _dependent_name(self, callee) -> str:
+        """模板里依赖名调用的被调名：`helper(v)` 藏在 OVERLOADED_DECL_REF 里，`obj.foo()` 只在 token 里。
+        `std::` 限定的调用与 `T(x)` / `std::int64_t(x)` 这类依赖类型构造不算（返回空串）。"""
+        toks = list(callee.get_tokens())
+        if toks[:2] and toks[0].spelling == "std" or [t.spelling for t in toks[:2]] == ["::", "std"]:
+            return ""
+        for sub in self.walk(callee):
+            if sub.kind == self.ck.OVERLOADED_DECL_REF and sub.spelling:
+                return sub.spelling
+        if callee.kind != self.ck.MEMBER_REF_EXPR:
+            return ""
+        accessors = [i for i, t in enumerate(toks) if t.spelling in (".", "->", "::")]
+        start = accessors[-1] + 1 if accessors else 0
+        for token in toks[start:]:
+            if token.kind == self.cx.TokenKind.IDENTIFIER:
+                return token.spelling
+        return ""
+
+    def _export(self, node) -> None:
+        """pybind11 / nanobind / Boost.Python 的 `def("名字", &函数)`：记下对 Python 暴露的名字。"""
+        args = [self.strip(a) for a in node.get_arguments()]
+        if not args or args[0].kind != self.ck.STRING_LITERAL or not args[0].spelling.endswith('"'):
+            return
+        exported = args[0].spelling[args[0].spelling.find('"') + 1:-1]
+        for arg in args[1:]:
+            if arg.kind == self.ck.UNARY_OPERATOR:
+                inner = self.children(arg)
+                arg = self.strip(inner[0]) if len(inner) == 1 else arg
+            if arg.kind == self.ck.DECL_REF_EXPR and arg.referenced is not None and arg.referenced.kind in self.k.FUNCS:
+                target = self._target(arg.referenced)
+                if target is not None:
+                    self.exports.append({"name": exported, **target})
+
+    def _record_class(self, node) -> None:
+        bases = []
+        for child in self.children(node):
+            if child.kind == self.ck.CXX_BASE_SPECIFIER:
+                usr = child.type.get_declaration().get_usr()
+                if usr:
+                    bases.append(usr)
+        self.classes.append({"usr": node.get_usr(), "name": node.spelling, "bases": bases})
 
     def _record_call(self, node, ref) -> None:
         decl_file = ref.location.file
@@ -545,22 +702,36 @@ class FileAnalyzer:
                 return "public_header"
         return None
 
-    def _function(self, func, outer) -> None:
-        kids = self.children(func)
-        params = [c for c in kids if c.kind == self.ck.PARM_DECL]
-        bodies = [c for c in kids if c.kind == self.ck.COMPOUND_STMT]
-        nested = outer is not None or (func.semantic_parent is not None and func.semantic_parent.kind in self.k.FUNCS)
-        exempt = self._exempt_reason(func, nested)
+    def _record_def(self, func, outer) -> Dict[str, Any]:
+        params = [c for c in self.children(func) if c.kind == self.ck.PARM_DECL]
+        parent = func.semantic_parent
+        nested = outer is not None or (parent is not None and parent.kind in self.k.FUNCS)
+        owner = parent if parent is not None and parent.kind in self.k.CLASSES else None
         defaults = []
         for index, param in enumerate(params):
             exprs = [c for c in self.children(param) if c.kind not in self.k.NON_EXPR_CHILDREN]
             if exprs:
                 defaults.append({"index": index, "name": param.spelling, "default": self.snippet(exprs[-1]),
                                  "null_default": self.is_null_literal(exprs[-1])})
-        self.defs.append({"file": self.rel_path, "line": func.location.line, "name": func.spelling,
-                          "qual": self.qualname(func), "usr": func.get_usr(), "exempt": exempt,
-                          "is_method": func.kind in (self.ck.CXX_METHOD, self.ck.CONSTRUCTOR, self.ck.DESTRUCTOR),
-                          "defaults": defaults})
+        loc = f"{self.rel_path}:{func.location.line}:{func.location.column}"
+        record = {"file": self.rel_path, "line": func.location.line, "end": func.extent.end.line,
+                  "name": func.spelling, "qual": self.qualname(func), "usr": func.get_usr(), "loc": loc,
+                  "exempt": self._exempt_reason(func, nested),
+                  "is_method": func.kind in (self.ck.CXX_METHOD, self.ck.CONSTRUCTOR, self.ck.DESTRUCTOR),
+                  "cls": owner.spelling if owner is not None else None,
+                  "class_usr": owner.get_usr() if owner is not None else None,
+                  "virtual": func.kind == self.ck.CXX_METHOD and func.is_virtual_method(),
+                  "sig": func.type.spelling, "nested": nested, "defaults": defaults}
+        self.defs.append(record)
+        self._func_loc[func.hash] = loc
+        return record
+
+    def _function(self, func, record: Dict[str, Any]) -> None:
+        kids = self.children(func)
+        params = [c for c in kids if c.kind == self.ck.PARM_DECL]
+        bodies = [c for c in kids if c.kind == self.ck.COMPOUND_STMT]
+        exempt = record["exempt"]
+        defaults = record["defaults"]
         if not bodies:
             return
         body = bodies[-1]
@@ -694,7 +865,8 @@ class FileAnalyzer:
     def _scan_tokens(self) -> None:
         token_kind = self.cx.TokenKind
         prod = self.role == "prod"
-        for token in self.tu.get_tokens(extent=self.tu.cursor.extent):
+        # 借宿解析时主文件是宿主 .cpp，所以按本文件的字节范围取 token。
+        for token in self.tu.get_tokens(extent=self.tu.get_extent(self.abs_path, (0, len(self.text)))):
             loc_file = token.location.file
             if loc_file is None or os.path.normpath(loc_file.name) != self.abs_path:
                 continue
@@ -738,24 +910,52 @@ class FileAnalyzer:
                               "symbol": os.path.basename(self.rel_path), "func": "<file>", "includes": includes})
 
 
-def analyze_task(task: Tuple[str, str, str, List[str]]) -> Dict[str, Any]:
-    """子进程入口：解析一个文件，返回纯数据事实。"""
-    repo_root, rel_path, role, args = task
+def _parse(cindex, abs_path: str, args: List[str]):
+    try:
+        return cindex.Index.create().parse(abs_path, args=args), None
+    except cindex.TranslationUnitLoadError as exc:
+        return None, str(exc)
+
+
+def _errors_in(cindex, tu, abs_path: str) -> List[str]:
+    return [
+        f"{d.location.line}: {d.spelling}" for d in tu.diagnostics
+        if d.severity >= cindex.Diagnostic.Error and d.location.file is not None
+        and os.path.normpath(d.location.file.name) == abs_path
+    ]
+
+
+Task = Tuple[str, str, str, List[str], Optional[Tuple[str, List[str]]]]
+
+
+def analyze_task(task: Task) -> Dict[str, Any]:
+    """子进程入口：解析一个文件，返回纯数据事实。
+
+    头文件先单独解析；不能自洽（缺前置 include 等）而出错时，改在包含它的源文件（宿主）的翻译单元里
+    分析它自己的那部分——clangd 处理头文件也是这个思路。哪边在本文件里的错误少就用哪边。
+    """
+    repo_root, rel_path, role, args, host = task
     cindex = _ck()
     abs_path = os.path.normpath(os.path.join(repo_root, rel_path))
     with open(abs_path, "rb") as handle:
         text = handle.read()
-    try:
-        tu = cindex.Index.create().parse(abs_path, args=args)
-    except cindex.TranslationUnitLoadError as exc:
-        return {"path": rel_path, "role": role, "fatal": str(exc), "errors": [], "hits": [], "decl_sites": {},
-                "defs": [], "calls": [], "identifiers": {}}
-    errors = [
-        f"{d.location.line}: {d.spelling}" for d in tu.diagnostics
-        if d.severity >= cindex.Diagnostic.Error and d.location.file is not None
-    ]
+    tu, fatal = _parse(cindex, abs_path, args)
+    errors = _errors_in(cindex, tu, abs_path) if tu is not None else []
+    hosted_by = None
+    if host is not None and (tu is None or errors):
+        host_tu, _ = _parse(cindex, os.path.normpath(os.path.join(repo_root, host[0])), host[1])
+        if host_tu is not None:
+            host_errors = _errors_in(cindex, host_tu, abs_path)
+            if tu is None or len(host_errors) < len(errors):
+                tu, errors, hosted_by = host_tu, host_errors, host[0]
+    if tu is None:
+        return {"path": rel_path, "role": role, "fatal": fatal, "errors": [], "hits": [], "decl_sites": {},
+                "defs": [], "calls": [], "identifiers": {}, "edges": [], "unresolved": [], "classes": [],
+                "exports": []}
     analyzer = FileAnalyzer(cindex, repo_root, rel_path, role, tu, text)
     analyzer.run()
     return {"path": rel_path, "role": role, "fatal": None, "errors": errors[:5], "error_count": len(errors),
+            "hosted_by": hosted_by,
             "hits": analyzer.hits, "decl_sites": dict(analyzer.decl_sites), "defs": analyzer.defs,
-            "calls": analyzer.calls, "identifiers": dict(analyzer.identifiers)}
+            "calls": analyzer.calls, "identifiers": dict(analyzer.identifiers), "edges": analyzer.edges,
+            "unresolved": analyzer.unresolved, "classes": analyzer.classes, "exports": analyzer.exports}

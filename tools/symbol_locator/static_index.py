@@ -8,6 +8,9 @@
 
 confident 边(ambiguous=False)与 ambiguous 边分开存:主结果只给 confident,
 ambiguous 仅以计数形式作盲区提示,不灌进主结果。
+
+混合仓库:C++ 快照(callgraph_extract_cpp 产物,默认 .checkup/callgraph_cpp/,CHECKUP_CALLGRAPH_CPP 覆盖)
+存在时一并载入。C++ 函数 info 带 lang="cpp";被 pybind11 等导出的函数还能按导出名(exported_as)查到。
 """
 from __future__ import annotations
 
@@ -24,6 +27,11 @@ CALLGRAPH_DIR = os.path.abspath(
 FUNCTIONS_JSON = os.path.join(CALLGRAPH_DIR, "functions.json")
 EDGES_JSON = os.path.join(CALLGRAPH_DIR, "edges.json")
 DYNAMIC_JSON = os.path.join(CALLGRAPH_DIR, "dynamic_unresolved.json")
+CPP_CALLGRAPH_DIR = os.path.abspath(
+    os.environ.get("CHECKUP_CALLGRAPH_CPP")
+    or os.path.join(REPO_ROOT, ".checkup", "callgraph_cpp"))
+CPP_FUNCTIONS_JSON = os.path.join(CPP_CALLGRAPH_DIR, "functions.json")
+LANGS = ("py", "cpp")
 
 
 class StaticIndex:
@@ -45,6 +53,9 @@ class StaticIndex:
     def _build(self):
         for key, info in self.functions.items():
             self._by_name[info["name"]].append(key)
+            for alias in info.get("exported_as", []):
+                if alias != info["name"]:
+                    self._by_name[alias].append(key)
         for edge in self.edges:
             if edge.get("ambiguous"):
                 self._amb_callers[edge["to"]].append(edge["from"])
@@ -53,10 +64,15 @@ class StaticIndex:
                 self._callers[edge["to"]].append(edge["from"])
                 self._callees[edge["from"]].append(edge["to"])
 
-    def lookup_name(self, name):
-        # type: (str) -> List[str]
-        """裸名 -> 所有定义 key(同名碰撞时返回多个)。"""
-        return list(self._by_name.get(name, []))
+    def lookup_name(self, name, lang=None):
+        # type: (str, Optional[str]) -> List[str]
+        """裸名(或绑定导出名) -> 所有定义 key(同名碰撞时返回多个);lang 限定 py / cpp。"""
+        keys = self._by_name.get(name, [])
+        return [key for key in keys if lang is None or self.lang(key) == lang]
+
+    def lang(self, key):
+        # type: (str) -> str
+        return self.functions[key].get("lang", "py")
 
     def all_names(self):
         # type: () -> List[str]
@@ -88,17 +104,27 @@ class StaticIndex:
         return self._dynamic.get(key, 0)
 
 
-def load(functions_path=None, edges_path=None, dynamic_path=None):
-    # type: (Optional[str], Optional[str], Optional[str]) -> StaticIndex
-    fp = functions_path or FUNCTIONS_JSON
-    ep = edges_path or EDGES_JSON
-    dp = dynamic_path or DYNAMIC_JSON
-    with open(fp, encoding="utf-8") as fh:
+def _read_snapshot(functions_path, edges_path, dynamic_path):
+    with open(functions_path, encoding="utf-8") as fh:
         functions = json.load(fh)
-    with open(ep, encoding="utf-8") as fh:
+    with open(edges_path, encoding="utf-8") as fh:
         edges = json.load(fh)
     dynamic = []
-    if os.path.exists(dp):
-        with open(dp, encoding="utf-8") as fh:
+    if os.path.exists(dynamic_path):
+        with open(dynamic_path, encoding="utf-8") as fh:
             dynamic = json.load(fh)
+    return functions, edges, dynamic
+
+
+def load(functions_path=None, edges_path=None, dynamic_path=None):
+    # type: (Optional[str], Optional[str], Optional[str]) -> StaticIndex
+    functions, edges, dynamic = _read_snapshot(
+        functions_path or FUNCTIONS_JSON, edges_path or EDGES_JSON, dynamic_path or DYNAMIC_JSON)
+    if os.path.exists(CPP_FUNCTIONS_JSON):
+        cpp_functions, cpp_edges, cpp_dynamic = _read_snapshot(
+            CPP_FUNCTIONS_JSON, os.path.join(CPP_CALLGRAPH_DIR, "edges.json"),
+            os.path.join(CPP_CALLGRAPH_DIR, "dynamic_unresolved.json"))
+        functions = dict(functions, **cpp_functions)
+        edges = edges + cpp_edges
+        dynamic = dynamic + cpp_dynamic
     return StaticIndex(functions, edges, dynamic=dynamic)

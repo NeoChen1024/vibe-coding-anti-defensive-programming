@@ -42,10 +42,13 @@ vibe-coding-anti-defensive-programming/
     ├── scan_dead_code_islands.py              # 6. 0 调用死代码孤岛防回潮扫描器（AST 快模 + SCIP 精模）
     ├── dead_code_usage/                       # 死代码孤岛 AST / SCIP 引用分析引擎
     ├── symbol_locator/                        # 7. 函数定义与上下游调用链定位器（whereis / callers / callees）
-    ├── callgraph/                             # 8. 函数级静态调用图与风险数据流提取引擎
+    ├── callgraph/                             # 8. 函数级静态调用图与风险数据流提取引擎（含 C++ 版 callgraph_extract_cpp.py）
     ├── scan_over_defense_cpp.py               # 9. C++ 反过度防御棘轮门禁（9 类高精度信号，与 Python 版共用基线库）
     ├── scan_over_defense_cpp_deep.py          # 10. C++ 全量深度探针（31 类 libclang AST / 跨文件信号）
-    └── cpp_scan/                              # C++ 扫描引擎（libclang 解析、单文件检测器、跨文件引用分析）
+    ├── scan_dead_code_islands_cpp.py          # 11. C++ 死代码孤岛防回潮（quick 按名字 / precise 用 clangd）
+    ├── scan_private_includes_cpp.py           # 12. C++ 跨组件包含私有/实现头文件棘轮
+    ├── scan_dead_path_literals_cpp.py         # 13. C++ 失效路径字面量棘轮
+    └── cpp_scan/                              # C++ 引擎（libclang 解析与检测、调用图建图、clangd LSP 客户端）
 ```
 
 ---
@@ -192,4 +195,33 @@ python3 -m tools.scan_over_defense_cpp --fail-on-new --strict-parse   # 门禁�
 - **文件角色**按路径片段判断，适配 monorepo 中嵌套的子项目：任一级目录名为 `tests/test/...` 或文件名形如 `test_x.cpp`、`x_test.cc` 为测试；`tools/scripts/examples/benchmarks/...` 为工具（只计引用不报信号）；`build/`、`third_party/`、`vendor/`、`contrib/` 等整体跳过；`--prod-dirs a,b` 可收窄报信号的范围。
 - **编译参数**：自动合并仓库根及一、二级子目录下 `build/`、`out/`、`cmake-build-*` 里的全部 `compile_commands.json`，也可用 `--compile-commands DIR` 指定；没有时退回 `-std=gnu++20` 并把所有 `include/` 与含头文件的目录加入 `-I`。
 - **跨语言引用**：C++ 版会读取仓库里的 Python、`.pyx/.pxd`、SWIG `.i`、导出表 `.def/.map` 等，ctypes / pybind11 按名字调用的 C++ 函数不会被误判为 0 引用；反过来 Python 版的 0 引用判定也会读取仓库内 C/C++ 源码（pybind11 `.attr("func")` 等）。
-- **代价**：解析时间主要花在 libclang 处理重型头文件（pybind11、nlohmann/json 等）上，按 CPU 核数并行（`--jobs N` 可调）；实测 70 个文件的混合仓库约 50 秒。
+- **代价**：解析时间主要花在 libclang 处理重型头文件（pybind11、nlohmann/json 等）上，按 CPU 核数并行（`--jobs N` 可调）；实测 70 个文件的混合仓库约 30～50 秒。
+- **不能自洽的头文件**（缺前置 `#include`、被包在宿主的 `namespace` 里 include）单独解析会出错，引擎会改在包含它的源文件的翻译单元里分析它，避免类型丢失造成的误报。
+
+### 7. C++ 调用图、符号定位、死代码与边界棘轮
+C++ 版与 Python 版共用产物结构、基线库与图指标（`tools/callgraph/callgraph_graph_metrics.py`），精确层由 clangd 担任（对应 Python 侧的 jedi / SCIP）：
+
+| Python 工具 | C++ 对应 | 精确层 |
+| :--- | :--- | :--- |
+| `callgraph/callgraph_extract.py` | `callgraph/callgraph_extract_cpp.py`：直接调用/构造/取地址回调为确信边；虚函数有覆写、模板依赖名为 ambiguous 边；函数指针与 `std::function` 记入 `dynamic_unresolved`；产物另带 `lang`、`usr` 与 pybind11 导出名 `exported_as` | libclang（编译器级名字查找） |
+| `symbol_locator` | 同一个命令同时载入 Python 与 C++ 快照（C++ 快照过期自动重建）；`--lang py\|cpp` 区分同名；可按 pybind11 导出名查到 C++ 函数 | `--at`、`--deep` 对 C++ 符号走 clangd |
+| `scan_dead_code_islands.py` | `scan_dead_code_islands_cpp.py`：quick 按名字找引用；precise 改用 clangd 的编译器级引用（同名重载、同名局部变量不再掩护死函数）；仍有解析错误的文件里的孤岛列为 unverified | clangd `textDocument/references` |
+| `scan_private_imports.py` | `scan_private_includes_cpp.py`：跨组件 `#include` 别人的 `detail/`、`internal/`、`*_impl.h`、`*_p.h`，或伸手进别的组件的 `src/` | — |
+| `scan_dead_path_literals.py` | `scan_dead_path_literals_cpp.py`：C++ 字符串（含 `R"(...)"`）里指向已删除仓库文件的路径 | — |
+
+```bash
+# C++ 调用图（产物默认 .checkup/callgraph_cpp/，CHECKUP_CALLGRAPH_CPP 可覆盖；需 networkx + libclang）
+python3 tools/callgraph/callgraph_extract_cpp.py
+
+# 符号定位：Python 与 C++ 一起查
+python3 -m tools.symbol_locator whereis <函数名或 pybind 导出名> [--lang cpp]
+python3 -m tools.symbol_locator callers <函数名> --deep          # C++ 符号走 clangd 调用层级（含 tests）
+python3 -m tools.symbol_locator whereis <函数名> --at src/a.cpp:42
+
+# 死代码孤岛 / 私有头文件 / 失效路径棘轮
+python3 tools/scan_dead_code_islands_cpp.py --mode quick           # 或 --mode precise（clangd）
+python3 -m tools.scan_private_includes_cpp --fail-on-new
+python3 -m tools.scan_dead_path_literals_cpp --fail-on-new
+```
+- **clangd 精确层**需要 `compile_commands.json`；clangd 后台索引缓存写在项目的 `.cache/clangd/index/`（与编辑器里的 clangd 共用），首次索引大型仓库可能需要数分钟，等待上限由 `CLANGD_INDEX_TIMEOUT`（秒）控制。
+- **未移植**：`runtime_callgraph_collect.py` / `callgraph_crossval.py`（依赖 Python `sys.setprofile` 运行时录像，C++ 需要插桩重新编译，不在静态工具范围内）；Python 版的敏感值数据流（`dataflow_nodes` / `risk_dataflow`）是业务项目专用规则，C++ 调用图不产出。

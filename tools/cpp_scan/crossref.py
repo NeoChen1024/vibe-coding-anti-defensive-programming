@@ -78,7 +78,7 @@ def cross_language_words(repo_root: str) -> Set[str]:
     return words
 
 
-def _net_refs(facts: Iterable[Dict[str, Any]]) -> Counter:
+def net_refs(facts: Iterable[Dict[str, Any]]) -> Counter:
     tokens: Counter = Counter()
     decls: Counter = Counter()
     for fact in facts:
@@ -93,8 +93,8 @@ def reference_hits(
     tool_counts: Counter,
     xlang_words: Set[str],
 ) -> List[Dict[str, Any]]:
-    refs_prod = _net_refs(prod_facts)
-    refs_test = _net_refs(test_facts)
+    refs_prod = net_refs(prod_facts)
+    refs_test = net_refs(test_facts)
     defs_by_name: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for fact in prod_facts:
         for definition in fact["defs"]:

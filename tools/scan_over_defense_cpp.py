@@ -78,8 +78,8 @@ def _entries(hits: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
-def scan(repo_root: str = REPO_ROOT, prod_dirs: Sequence[str] = (), compile_db_dir: Optional[str] = None,
-         jobs: Optional[int] = None) -> Dict[str, Any]:
+def scan(repo_root: str, prod_dirs: Sequence[str], compile_db_dir: Optional[str],
+         jobs: Optional[int]) -> Dict[str, Any]:
     raw = scan_cpp(repo_root, prod_dirs, compile_db_dir, jobs)
     entries = _entries(hit for hit in raw["hits"] if hit["kind"] in KINDS)
     kind_totals = {kind: 0 for kind in KINDS}
